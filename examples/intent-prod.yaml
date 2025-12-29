@@ -1,0 +1,10 @@
+
+version: v1
+environment:
+  name: prod
+application:
+  name: demo
+infrastructure:
+  provider: aws
+deployment:
+  replicas: 1

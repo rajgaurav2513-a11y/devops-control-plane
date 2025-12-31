@@ -1,15 +1,17 @@
 from core.models.result import ExecutionResult, Status
 
-from engines.infra.terraform_engine import provision
 from engines.container.builder import build_image
+from engines.container.tester import run_tests
+from engines.container.quality import run_quality_checks
+from engines.infra.terraform_engine import provision
 from engines.deploy.k8s_engine import deploy_app
 from state.snapshots import save_snapshot
 
 
 def execute(intent: dict):
     """
-    Main execution orchestrator.
-    Executes stages sequentially and STOPS on failure.
+    Agentic Orchestrator:
+    Executes stages sequentially and STOPS on FAILED or BLOCKED.
     """
     results = []
 
@@ -20,7 +22,25 @@ def execute(intent: dict):
     results.append(build_result)
 
     if build_result.status != Status.SUCCESS:
-        return results  # ⛔ STOP EXECUTION ON BUILD FAILURE / BLOCKED
+        return results  # ⛔ STOP ON BUILD FAIL / BLOCK
+
+    # =========================
+    # TEST STAGE
+    # =========================
+    test_result = run_tests(intent)
+    results.append(test_result)
+
+    if test_result.status != Status.SUCCESS:
+        return results  # ⛔ STOP ON TEST FAIL / BLOCK
+
+    # =========================
+    # QUALITY STAGE
+    # =========================
+    quality_result = run_quality_checks(intent)
+    results.append(quality_result)
+
+    if quality_result.status != Status.SUCCESS:
+        return results  # ⛔ STOP ON QUALITY BLOCK / FAIL
 
     # =========================
     # INFRA STAGE
@@ -35,59 +55,60 @@ def execute(intent: dict):
         )
         results.append(infra_result)
     except Exception as e:
-        infra_result = ExecutionResult(
-            stage="INFRA",
-            status=Status.FAILED,
-            message="Infrastructure provisioning failed",
-            logs=[str(e)],
-            action="Fix infrastructure configuration and re-run",
+        results.append(
+            ExecutionResult(
+                stage="INFRA",
+                status=Status.FAILED,
+                message="Infrastructure provisioning failed",
+                logs=[str(e)],
+                action="Fix infrastructure configuration and re-run",
+            )
         )
-        results.append(infra_result)
-        return results  # ⛔ STOP EXECUTION
+        return results  # ⛔ STOP
 
     # =========================
     # DEPLOY STAGE
     # =========================
     try:
-        deploy_app(intent, build_result)
-        deploy_result = ExecutionResult(
-            stage="DEPLOY",
-            status=Status.SUCCESS,
-            message="Application deployed successfully (simulated)",
-            logs=["Blue/Green deployment simulated"],
-        )
+        deploy_result = deploy_app(intent)
         results.append(deploy_result)
+
+        if deploy_result.status != Status.SUCCESS:
+            return results  # ⛔ STOP
     except Exception as e:
-        deploy_result = ExecutionResult(
-            stage="DEPLOY",
-            status=Status.FAILED,
-            message="Deployment failed",
-            logs=[str(e)],
-            action="Check deployment logs and retry",
+        results.append(
+            ExecutionResult(
+                stage="DEPLOY",
+                status=Status.FAILED,
+                message="Deployment failed",
+                logs=[str(e)],
+                action="Check deployment configuration and retry",
+            )
         )
-        results.append(deploy_result)
-        return results  # ⛔ STOP EXECUTION
+        return results  # ⛔ STOP
 
     # =========================
-    # SNAPSHOT STAGE
+    # SNAPSHOT STAGE (NON-BLOCKING)
     # =========================
     try:
         save_snapshot(intent)
-        snapshot_result = ExecutionResult(
-            stage="SNAPSHOT",
-            status=Status.SUCCESS,
-            message="Execution snapshot saved",
-            logs=["System state recorded successfully"],
+        results.append(
+            ExecutionResult(
+                stage="SNAPSHOT",
+                status=Status.SUCCESS,
+                message="Execution snapshot saved",
+                logs=["System state recorded"],
+            )
         )
-        results.append(snapshot_result)
     except Exception as e:
-        snapshot_result = ExecutionResult(
-            stage="SNAPSHOT",
-            status=Status.BLOCKED,
-            message="Snapshot could not be saved",
-            logs=[str(e)],
-            action="Check snapshot storage",
+        results.append(
+            ExecutionResult(
+                stage="SNAPSHOT",
+                status=Status.BLOCKED,
+                message="Snapshot could not be saved",
+                logs=[str(e)],
+                action="Check snapshot storage",
+            )
         )
-        results.append(snapshot_result)
 
     return results

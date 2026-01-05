@@ -1,32 +1,57 @@
 import os
 import subprocess
 import tempfile
+import shutil
 
 from core.models.result import ExecutionResult, Status
 from engines.container.dockerfile_generator import generate_dockerfile
 
 
 def build_docker_image(intent: dict, language: str, image_name: str) -> ExecutionResult:
+    logs = []
+
     dockerfile_content = generate_dockerfile(language)
 
-    if dockerfile_content is None:
+    # Workspace always comes from executor (local or git)
+    app_path = intent["_execution"].get("workspace")
+
+    if not dockerfile_content:
         return ExecutionResult(
             stage="BUILD",
             status=Status.BLOCKED,
             message="Unsupported language for Docker build",
-            logs=[f"Detected language: {language}"],
-            action="Add Dockerfile support for this language",
+            logs=[f"language={language}"],
+        )
+
+    if not app_path or not os.path.isdir(app_path):
+        return ExecutionResult(
+            stage="BUILD",
+            status=Status.FAILED,
+            message="Invalid application workspace",
+            logs=[f"workspace={app_path}"],
         )
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            # copy source code
-            os.system(f"cp -r . {tmpdir}")
+            # Copy source code to temp directory
+            for item in os.listdir(app_path):
+                if item in [".git", "__pycache__", ".venv", "venv"]:
+                    continue
 
+                src = os.path.join(app_path, item)
+                dst = os.path.join(tmpdir, item)
+
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+
+            # Write generated Dockerfile
             dockerfile_path = os.path.join(tmpdir, "Dockerfile")
             with open(dockerfile_path, "w") as f:
                 f.write(dockerfile_content)
 
+            # Run Docker build
             process = subprocess.Popen(
                 ["docker", "build", "-t", image_name, tmpdir],
                 stdout=subprocess.PIPE,
@@ -34,9 +59,8 @@ def build_docker_image(intent: dict, language: str, image_name: str) -> Executio
                 text=True,
             )
 
-            logs = []
             for line in process.stdout:
-                logs.append(line.strip())
+                logs.append(line.rstrip())
 
             process.wait()
 
@@ -46,7 +70,6 @@ def build_docker_image(intent: dict, language: str, image_name: str) -> Executio
                     status=Status.FAILED,
                     message="Docker build failed",
                     logs=logs,
-                    action="Fix Docker build errors and retry",
                 )
 
             return ExecutionResult(
@@ -62,5 +85,4 @@ def build_docker_image(intent: dict, language: str, image_name: str) -> Executio
             status=Status.FAILED,
             message="Docker build execution error",
             logs=[str(e)],
-            action="Check Docker installation and permissions",
         )

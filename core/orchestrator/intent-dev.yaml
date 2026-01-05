@@ -1,0 +1,11 @@
+environment:
+  name: staging
+
+application:
+  name: frontend-ui
+
+build:
+  test: true
+
+deployment:
+  replicas: 2

@@ -1,31 +1,20 @@
-from core.models.result import ExecutionResult, Status
+from core.models.result import ExecutionResult
 from engines.container.detector import detect_language
-
-from engines.container.adapters import java
-from engines.container.adapters import python as python_adapter
-from engines.container.adapters import node
+from engines.container.docker_builder import build_docker_image
 
 
 def build_image(intent: dict) -> ExecutionResult:
     """
-    Detects application language and dispatches to the correct build adapter.
-    Returns an ExecutionResult.
+    Docker BUILD agent with artifact tagging
     """
     language = detect_language()
+    app_name = intent.get("application", {}).get("name", "app").lower()
+    artifact_tag = intent["_execution"]["artifact_tag"]
 
-    if language.startswith("java"):
-        return java.run_build(intent)
+    image_name = f"{app_name}:{artifact_tag}"
 
-    if language == "python":
-        return python_adapter.run_build(intent)
-
-    if language == "node":
-        return node.run_build(intent)
-
-    return ExecutionResult(
-        stage="BUILD",
-        status=Status.BLOCKED,
-        message="Unsupported application language",
-        logs=[f"Detected language: {language}"],
-        action="Add a build adapter for this language",
+    return build_docker_image(
+        intent=intent,
+        language=language,
+        image_name=image_name,
     )

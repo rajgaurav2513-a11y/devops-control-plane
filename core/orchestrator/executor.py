@@ -1,114 +1,278 @@
-from core.models.result import ExecutionResult, Status
+# core/orchestrator/executor.py
 
+import uuid
+import os
+
+from core.models.result import ExecutionResult, Status
+from state.execution_store import mark_stage_complete, get_last_completed_stage
+
+from core.intent.validator import validate_intent
+
+from engines.source.git_agent import prepare_source, cleanup_source
 from engines.container.builder import build_image
 from engines.container.tester import run_tests
 from engines.container.quality import run_quality_checks
+from engines.container.docker_runner import run_container
+from engines.container.docker_health import docker_available
+
 from engines.infra.terraform_engine import provision
-from engines.deploy.k8s_engine import deploy_app
+from engines.infra.plan_normalizer import normalize_plan
+from engines.infra.risk_rules import evaluate_risks
+from engines.infra.public_exposure_rules import evaluate_public_exposure
+from engines.infra.cost_risk_rules import evaluate_cost_risk
+from engines.infra.fix_suggestion_engine import generate_infra_fix_suggestions
+
+from engines.deploy.local_docker import deploy_local
 from state.snapshots import save_snapshot
 
 
+STAGE_ORDER = [
+    "SOURCE",
+    "BUILD",
+    "TEST",
+    "QUALITY",
+    "CONFIG",
+    "RUN",
+    "INFRA",
+    "INFRA-RISK",
+    "INFRA-PUBLIC-RISK",
+    "INFRA-COST-RISK",
+    "FIX-SUGGESTIONS",
+    "DEPLOY",
+    "SNAPSHOT",
+]
+
+
+def is_code_required(intent: dict) -> bool:
+    return "application" in intent
+
+
+def has_infra(intent: dict) -> bool:
+    return "infra" in intent
+
+
 def execute(intent: dict):
-    """
-    Agentic Orchestrator:
-    Executes stages sequentially and STOPS on FAILED or BLOCKED.
-    """
     results = []
 
-    # =========================
-    # BUILD STAGE
-    # =========================
-    build_result = build_image(intent)
-    results.append(build_result)
+    execution_id = intent.get("_execution", {}).get("id") or str(uuid.uuid4())[:8]
+    artifact_tag = f"exec-{execution_id}"
 
-    if build_result.status != Status.SUCCESS:
-        return results  # ⛔ STOP ON BUILD FAIL / BLOCK
+    intent["_execution"] = {
+        "id": execution_id,
+        "artifact_tag": artifact_tag,
+    }
 
-    # =========================
-    # TEST STAGE
-    # =========================
-    test_result = run_tests(intent)
-    results.append(test_result)
+    last_completed = get_last_completed_stage(execution_id)
 
-    if test_result.status != Status.SUCCESS:
-        return results  # ⛔ STOP ON TEST FAIL / BLOCK
+    def should_run(stage: str) -> bool:
+        if not last_completed:
+            return True
+        return STAGE_ORDER.index(stage) > STAGE_ORDER.index(last_completed)
 
-    # =========================
-    # QUALITY STAGE
-    # =========================
-    quality_result = run_quality_checks(intent)
-    results.append(quality_result)
+    code_required = is_code_required(intent)
+    infra_required = has_infra(intent)
 
-    if quality_result.status != Status.SUCCESS:
-        return results  # ⛔ STOP ON QUALITY BLOCK / FAIL
+    # -----------------------------
+    # SOURCE
+    # -----------------------------
+    if code_required and should_run("SOURCE"):
+        workspace = prepare_source(intent)
 
-    # =========================
-    # INFRA STAGE
-    # =========================
-    try:
-        infra_state = provision(intent)
-        infra_result = ExecutionResult(
-            stage="INFRA",
-            status=Status.SUCCESS,
-            message="Infrastructure provisioned successfully",
-            logs=[f"Infrastructure state: {infra_state}"],
-        )
-        results.append(infra_result)
-    except Exception as e:
+        if not workspace or not os.path.isdir(workspace):
+            results.append(
+                ExecutionResult(
+                    stage="SOURCE",
+                    status=Status.BLOCKED,
+                    message="Invalid application workspace",
+                    logs=[f"workspace={workspace}"],
+                )
+            )
+            return results
+
+        intent["_execution"]["workspace"] = workspace
+        mark_stage_complete(execution_id, "SOURCE")
+
+    # -----------------------------
+    # BUILD
+    # -----------------------------
+    if code_required and should_run("BUILD"):
+        if not docker_available():
+            results.append(
+                ExecutionResult(
+                    stage="BUILD",
+                    status=Status.BLOCKED,
+                    message="Docker engine not reachable",
+                    logs=[
+                        "Ensure Docker Desktop is running",
+                        "Ensure WSL integration is enabled",
+                    ],
+                )
+            )
+            return results
+
+        r = build_image(intent)
+        results.append(r)
+        if r.status != Status.SUCCESS:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "BUILD")
+
+    # -----------------------------
+    # TEST
+    # -----------------------------
+    if code_required and should_run("TEST"):
+        r = run_tests(intent)
+        results.append(r)
+        if r.status != Status.SUCCESS:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "TEST")
+
+    # -----------------------------
+    # QUALITY
+    # -----------------------------
+    if code_required and should_run("QUALITY"):
+        r = run_quality_checks(intent)
+        results.append(r)
+        if r.status != Status.SUCCESS:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "QUALITY")
+
+    # -----------------------------
+    # CONFIG
+    # -----------------------------
+    if should_run("CONFIG"):
+        r = validate_intent(intent)
+        results.append(r)
+        if r.status != Status.SUCCESS:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "CONFIG")
+
+    # -----------------------------
+    # RUN
+    # -----------------------------
+    if code_required and should_run("RUN"):
+        app = intent.get("application", {}).get("name", "app").lower()
+        image = f"{app}:{artifact_tag}"
+
+        r = run_container(intent=intent, image_name=image)
+        results.append(r)
+        if r.status != Status.SUCCESS:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "RUN")
+
+    # -----------------------------
+    # INFRA (Terraform PLAN)
+    # -----------------------------
+    if infra_required and should_run("INFRA"):
+        plan = provision(intent)
+        normalized = normalize_plan(plan)
+
         results.append(
             ExecutionResult(
                 stage="INFRA",
-                status=Status.FAILED,
-                message="Infrastructure provisioning failed",
-                logs=[str(e)],
-                action="Fix infrastructure configuration and re-run",
+                status=Status.SUCCESS,
+                message="Terraform plan analyzed",
+                logs=[
+                    f"Create: {normalized['create']}",
+                    f"Update: {normalized['update']}",
+                    f"Delete: {normalized['delete']}",
+                    f"Replace: {normalized['replace']}",
+                ],
             )
         )
-        return results  # ⛔ STOP
 
-    # =========================
-    # DEPLOY STAGE
-    # =========================
-    try:
-        deploy_result = deploy_app(intent)
-        results.append(deploy_result)
+        mark_stage_complete(execution_id, "INFRA")
 
-        if deploy_result.status != Status.SUCCESS:
-            return results  # ⛔ STOP
-    except Exception as e:
-        results.append(
-            ExecutionResult(
-                stage="DEPLOY",
-                status=Status.FAILED,
-                message="Deployment failed",
-                logs=[str(e)],
-                action="Check deployment configuration and retry",
+    # -----------------------------
+    # INFRA STRUCTURAL RISK
+    # -----------------------------
+    if infra_required and should_run("INFRA-RISK"):
+        r = evaluate_risks(normalized)
+        results.append(r)
+        mark_stage_complete(execution_id, "INFRA-RISK")
+
+    # -----------------------------
+    # INFRA PUBLIC EXPOSURE
+    # -----------------------------
+    if infra_required and should_run("INFRA-PUBLIC-RISK"):
+        r = evaluate_public_exposure(plan)
+        results.append(r)
+
+        if r.status == Status.BLOCKED:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "INFRA-PUBLIC-RISK")
+
+    # -----------------------------
+    # INFRA COST RISK
+    # -----------------------------
+    if infra_required and should_run("INFRA-COST-RISK"):
+        r = evaluate_cost_risk(plan)
+        results.append(r)
+
+        if r.status == Status.BLOCKED:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "INFRA-COST-RISK")
+
+    # -----------------------------
+    # FIX SUGGESTIONS
+    # -----------------------------
+    if should_run("FIX-SUGGESTIONS"):
+        r = generate_infra_fix_suggestions(results)
+        results.append(r)
+        mark_stage_complete(execution_id, "FIX-SUGGESTIONS")
+
+    # -----------------------------
+    # DEPLOY (OPTIONAL)
+    # -----------------------------
+    if code_required and should_run("DEPLOY"):
+        deploy_cfg = intent.get("deploy", {})
+
+        if deploy_cfg.get("enabled") and deploy_cfg.get("mode") == "local":
+            app = intent.get("application", {}).get("name", "app").lower()
+            image = f"{app}:{artifact_tag}"
+            results.append(deploy_local(intent, image))
+        else:
+            results.append(
+                ExecutionResult(
+                    stage="DEPLOY",
+                    status=Status.SKIPPED,
+                    message="Deployment skipped",
+                    logs=[],
+                )
             )
-        )
-        return results  # ⛔ STOP
 
-    # =========================
-    # SNAPSHOT STAGE (NON-BLOCKING)
-    # =========================
-    try:
+        mark_stage_complete(execution_id, "DEPLOY")
+
+    # -----------------------------
+    # SNAPSHOT
+    # -----------------------------
+    if should_run("SNAPSHOT"):
         save_snapshot(intent)
         results.append(
             ExecutionResult(
                 stage="SNAPSHOT",
                 status=Status.SUCCESS,
                 message="Execution snapshot saved",
-                logs=["System state recorded"],
+                logs=[
+                    f"execution_id={execution_id}",
+                    f"artifact={artifact_tag}",
+                ],
             )
         )
-    except Exception as e:
-        results.append(
-            ExecutionResult(
-                stage="SNAPSHOT",
-                status=Status.BLOCKED,
-                message="Snapshot could not be saved",
-                logs=[str(e)],
-                action="Check snapshot storage",
-            )
-        )
+        mark_stage_complete(execution_id, "SNAPSHOT")
 
+    cleanup_source(intent)
     return results

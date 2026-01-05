@@ -6,6 +6,7 @@ class Status(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
+    SKIPPED = "SKIPPED"
 
 
 class ExecutionResult:

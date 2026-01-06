@@ -1,5 +1,4 @@
 import subprocess
-
 from core.models.result import ExecutionResult, Status
 
 
@@ -15,39 +14,36 @@ def deploy_local(intent: dict, image: str) -> ExecutionResult:
     container_name = f"{execution_id}-local"
 
     try:
-        # Remove existing container if present
         subprocess.call(
             ["docker", "rm", "-f", container_name],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-        # Run container in detached (service) mode
         container_id = subprocess.check_output(
-            ["docker", "run", "-d", "--name", container_name, *port_args, image],
-            text=True,
-        ).strip()
-
-        logs = [
-            f"container_name={container_name}",
-            f"container_id={container_id}",
-        ]
-
-        for p in ports:
-            host_port = p.split(":")[0]
-            logs.append(f"http://localhost:{host_port}")
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                container_name,
+                *port_args,
+                image,
+            ],
+            stderr=subprocess.STDOUT,
+        ).decode().strip()
 
         return ExecutionResult(
             stage="DEPLOY",
             status=Status.SUCCESS,
-            message="Application deployed locally",
-            logs=logs,
+            message="Container deployed locally",
+            logs=[f"container_id={container_id}"],
         )
 
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
         return ExecutionResult(
             stage="DEPLOY",
-            status=Status.FAILED,
-            message="Local Docker deployment failed",
-            logs=[str(e)],
+            status=Status.BLOCKED,
+            message="Local docker deployment failed",
+            logs=[e.output.decode() if e.output else str(e)],
         )

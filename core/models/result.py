@@ -4,6 +4,7 @@ from typing import List, Optional
 
 class Status(str, Enum):
     SUCCESS = "SUCCESS"
+    WARNING = "WARNING"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
     SKIPPED = "SKIPPED"

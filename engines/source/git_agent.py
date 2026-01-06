@@ -14,20 +14,38 @@ def _on_rm_error(func, path, exc_info):
         pass
 
 
-def prepare_source(intent: dict) -> str:
-    source = intent.get("source", {"type": "local"})
+def prepare_source(intent: dict) -> str | None:
+    # ✅ SINGLE SOURCE OF TRUTH
+    app = intent.get("application")
+    if not app:
+        return None
+
+    source = app.get("source", {})
+    source_type = source.get("type", "local")
     exec_id = intent["_execution"]["id"]
 
     # -------------------------
-    # LOCAL SOURCE
+    # LOCAL SOURCE (FINAL FIX)
     # -------------------------
-    if source.get("type") == "local":
-        return intent.get("application", {}).get("path")
+    if source_type == "local":
+        path = source.get("path")
+        if not path:
+            return None
+
+        abs_path = os.path.abspath(path)
+
+        if not os.path.isdir(abs_path):
+            return None
+
+        return abs_path
 
     # -------------------------
-    # GIT SOURCE
+    # GIT SOURCE (UNCHANGED)
     # -------------------------
-    repo = source["repo"]
+    repo = source.get("repo")
+    if not repo:
+        return None
+
     branch = source.get("branch", "main")
     commit = source.get("commit")
     auth = source.get("auth")
@@ -42,35 +60,25 @@ def prepare_source(intent: dict) -> str:
 
     clone_cmd = ["git", "clone", "--depth", "1", "-b", branch]
 
-    # 🔐 PRIVATE REPO AUTH (TOKEN)
     if auth and auth.get("type") == "token":
         token_env = auth.get("token_env")
         token = os.getenv(token_env)
-
         if not token:
             raise RuntimeError(f"Git token env var not set: {token_env}")
-
-        # Insert token safely into URL (never logged)
-        repo = repo.replace(
-            "https://",
-            f"https://{token}@"
-        )
+        repo = repo.replace("https://", f"https://{token}@")
 
     clone_cmd.extend([repo, workspace])
-
     subprocess.check_call(clone_cmd)
 
     if commit:
-        subprocess.check_call(
-            ["git", "checkout", commit],
-            cwd=workspace
-        )
+        subprocess.check_call(["git", "checkout", commit], cwd=workspace)
 
     return workspace
 
 
 def cleanup_source(intent: dict):
-    source = intent.get("source", {"type": "local"})
+    app = intent.get("application", {})
+    source = app.get("source", {})
 
     if source.get("type") != "git":
         return
@@ -88,5 +96,3 @@ def cleanup_source(intent: dict):
             return
         except PermissionError:
             time.sleep(1)
-
-    print(f"[WARN] Could not fully delete workspace: {workspace}")

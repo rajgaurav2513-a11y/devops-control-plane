@@ -1,5 +1,4 @@
 # core/orchestrator/executor.py
-# 🔧 FULL FILE WITH FINAL APPROVAL FIX (COPY–PASTE)
 
 import uuid
 import os
@@ -9,6 +8,7 @@ from state.execution_store import mark_stage_complete, get_last_completed_stage
 from state.snapshots import save_snapshot
 
 from core.intent.validator import validate_intent
+from core.policy.evaluator import evaluate_policies
 
 from engines.source.git_agent import prepare_source, cleanup_source
 from engines.container.builder import build_image
@@ -25,9 +25,7 @@ from engines.infra.cost_risk_rules import evaluate_cost_risk
 from engines.infra.fix_suggestion_engine import generate_infra_fix_suggestions
 
 from engines.deploy.local_docker import deploy_local
-
-from core.approval.model import ApprovalRecord, ApprovalStatus
-from core.approval.store import load as load_approval, save as save_approval
+from engines.deploy.local_auto import auto_deploy_local
 
 
 STAGE_ORDER = [
@@ -36,14 +34,13 @@ STAGE_ORDER = [
     "TEST",
     "QUALITY",
     "CONFIG",
+    "POLICY",
     "RUN",
     "INFRA",
     "INFRA-RISK",
     "INFRA-PUBLIC-RISK",
     "INFRA-COST-RISK",
-    "APPROVAL",
     "FIX-SUGGESTIONS",
-    "DEPLOY",
     "SNAPSHOT",
 ]
 
@@ -59,10 +56,7 @@ def has_infra(intent: dict) -> bool:
 def execute(intent: dict):
     results = []
 
-    execution_id = intent.get("_execution", {}).get("id")
-    if not execution_id:
-        execution_id = str(uuid.uuid4())[:8]
-
+    execution_id = intent.get("_execution", {}).get("id") or str(uuid.uuid4())[:8]
     artifact_tag = f"exec-{execution_id}"
 
     intent["_execution"] = {
@@ -80,8 +74,18 @@ def execute(intent: dict):
     code_required = is_code_required(intent)
     infra_required = has_infra(intent)
 
+    # -----------------------------
+    # SOURCE (LOCAL PATH OR GIT)
+    # -----------------------------
     if code_required and should_run("SOURCE"):
-        workspace = prepare_source(intent)
+        app_cfg = intent.get("application", {})
+        local_path = app_cfg.get("path")
+
+        if local_path:
+            workspace = os.path.abspath(local_path)
+        else:
+            workspace = prepare_source(intent)
+
         if not workspace or not os.path.isdir(workspace):
             results.append(
                 ExecutionResult(
@@ -92,9 +96,13 @@ def execute(intent: dict):
                 )
             )
             return results
+
         intent["_execution"]["workspace"] = workspace
         mark_stage_complete(execution_id, "SOURCE")
 
+    # -----------------------------
+    # BUILD
+    # -----------------------------
     if code_required and should_run("BUILD"):
         if not docker_available():
             results.append(
@@ -112,45 +120,80 @@ def execute(intent: dict):
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
+
         mark_stage_complete(execution_id, "BUILD")
 
+    # -----------------------------
+    # TEST
+    # -----------------------------
     if code_required and should_run("TEST"):
         r = run_tests(intent)
         results.append(r)
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
+
         mark_stage_complete(execution_id, "TEST")
 
+    # -----------------------------
+    # QUALITY
+    # -----------------------------
     if code_required and should_run("QUALITY"):
         r = run_quality_checks(intent)
         results.append(r)
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
+
         mark_stage_complete(execution_id, "QUALITY")
 
+    # -----------------------------
+    # CONFIG
+    # -----------------------------
     if should_run("CONFIG"):
         r = validate_intent(intent)
         results.append(r)
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
+
         mark_stage_complete(execution_id, "CONFIG")
 
+    # -----------------------------
+    # POLICY (ENFORCED)
+    # -----------------------------
+    if should_run("POLICY"):
+        policy_results = evaluate_policies(intent)
+        results.extend(policy_results)
+
+        if any(r.status == Status.BLOCKED for r in policy_results):
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "POLICY")
+
+    # -----------------------------
+    # RUN (CONTAINER TEST RUN)
+    # -----------------------------
     if code_required and should_run("RUN"):
         app = intent.get("application", {}).get("name", "app").lower()
         image = f"{app}:{artifact_tag}"
-        r = run_container(intent, image)
+
+        r = run_container(intent=intent, image_name=image)
         results.append(r)
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
+
         mark_stage_complete(execution_id, "RUN")
 
+    # -----------------------------
+    # INFRA (PLAN ONLY)
+    # -----------------------------
     if infra_required and should_run("INFRA"):
         plan = provision(intent)
         normalized = normalize_plan(plan)
+
         results.append(
             ExecutionResult(
                 stage="INFRA",
@@ -164,8 +207,12 @@ def execute(intent: dict):
                 ],
             )
         )
+
         mark_stage_complete(execution_id, "INFRA")
 
+    # -----------------------------
+    # INFRA RISKS
+    # -----------------------------
     if infra_required and should_run("INFRA-RISK"):
         r = evaluate_risks(normalized)
         results.append(r)
@@ -175,61 +222,31 @@ def execute(intent: dict):
         r = evaluate_public_exposure(plan)
         results.append(r)
         if r.status == Status.BLOCKED:
+            cleanup_source(intent)
             return results
+
         mark_stage_complete(execution_id, "INFRA-PUBLIC-RISK")
 
     if infra_required and should_run("INFRA-COST-RISK"):
         r = evaluate_cost_risk(plan)
         results.append(r)
         if r.status == Status.BLOCKED:
+            cleanup_source(intent)
             return results
+
         mark_stage_complete(execution_id, "INFRA-COST-RISK")
 
-    # =============================
-    # APPROVAL GATE (FINAL)
-    # =============================
-    if should_run("APPROVAL"):
-        approval = load_approval(execution_id)
-
-        if not approval:
-            approval = ApprovalRecord(
-                execution_id=execution_id,
-                status=ApprovalStatus.PENDING,
-            )
-            save_approval(approval)
-
-        if approval.status in (
-            ApprovalStatus.PENDING,
-            ApprovalStatus.HELD,
-        ):
-            results.append(
-                ExecutionResult(
-                    stage="APPROVAL",
-                    status=Status.SUCCESS,
-                    message=f"Approval status: {approval.status}",
-                    logs=[f"execution_id={execution_id}"],
-                )
-            )
-            return results
-
-        if approval.status == ApprovalStatus.REJECTED:
-            results.append(
-                ExecutionResult(
-                    stage="APPROVAL",
-                    status=Status.BLOCKED,
-                    message="Execution rejected by approver",
-                    logs=[f"execution_id={execution_id}"],
-                )
-            )
-            return results
-
-        mark_stage_complete(execution_id, "APPROVAL")
-
+    # -----------------------------
+    # FIX SUGGESTIONS
+    # -----------------------------
     if should_run("FIX-SUGGESTIONS"):
         r = generate_infra_fix_suggestions(results)
         results.append(r)
         mark_stage_complete(execution_id, "FIX-SUGGESTIONS")
 
+    # -----------------------------
+    # SNAPSHOT
+    # -----------------------------
     if should_run("SNAPSHOT"):
         save_snapshot(intent)
         results.append(
@@ -237,10 +254,28 @@ def execute(intent: dict):
                 stage="SNAPSHOT",
                 status=Status.SUCCESS,
                 message="Execution snapshot saved",
-                logs=[f"execution_id={execution_id}"],
+                logs=[
+                    f"execution_id={execution_id}",
+                    f"artifact={artifact_tag}",
+                ],
             )
         )
         mark_stage_complete(execution_id, "SNAPSHOT")
+
+    # -----------------------------
+    # AUTO-DEPLOY (V2)
+    # -----------------------------
+    exec_mode = intent.get("execution", {}).get("mode", "analyze")
+    deploy_cfg = intent.get("deploy", {})
+    blocked = any(r.status == Status.BLOCKED for r in results)
+
+    if exec_mode == "auto-deploy" and not blocked:
+        if deploy_cfg.get("mode") == "docker":
+            app = intent.get("application", {}).get("name", "app").lower()
+            image = f"{app}:{artifact_tag}"
+            results.append(deploy_local(intent, image))
+        else:
+            results.append(auto_deploy_local(intent))
 
     cleanup_source(intent)
     return results

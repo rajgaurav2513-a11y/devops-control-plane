@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 class Status(str, Enum):
@@ -15,15 +15,17 @@ class ExecutionResult:
         self,
         stage: str,
         status: Status,
-        message: str,
+        message: str = "",
         logs: Optional[List[str]] = None,
         action: Optional[str] = None,
+        policy_report: Optional[Dict] = None,
     ):
         self.stage = stage
         self.status = status
         self.message = message
         self.logs = logs or []
         self.action = action
+        self.policy_report = policy_report
 
     def to_dict(self):
         return {
@@ -32,4 +34,5 @@ class ExecutionResult:
             "message": self.message,
             "logs": self.logs,
             "action": self.action,
+            "policy_report": self.policy_report,
         }

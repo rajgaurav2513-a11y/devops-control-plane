@@ -1,38 +1,57 @@
-from typing import List
 from core.models.result import ExecutionResult, Status
-from core.policy.model import Policy
 
 
-def evaluate_policies(intent: dict) -> List[ExecutionResult]:
-    results = []
+def _get_nested(data: dict, key: str):
+    cur = data
+    for part in key.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
 
-    raw_policies = intent.get("policies", [])
-    if not raw_policies:
-        return results
 
-    for p in raw_policies:
-        policy = Policy(
-            id=p.get("id"),
-            when=p.get("when", {}),
-            action=p.get("action", "WARN"),
-            message=p.get("message", ""),
-        )
+def evaluate_policies(intent: dict):
+    policies = intent.get("policies", [])
+    triggered = []
+    blocked = False
 
-        violated = True
-        for key, expected in policy.when.items():
-            if intent.get(key) != expected:
-                violated = False
+    for policy in policies:
+        condition = policy.get("when", {})
+        action = policy.get("action")
+        message = policy.get("message", "")
+        policy_id = policy.get("id")
+
+        matched = True
+        for key, expected in condition.items():
+            if _get_nested(intent, key) != expected:
+                matched = False
                 break
 
-        if violated:
-            status = Status.BLOCKED if policy.action == "BLOCK" else Status.WARNING
-            results.append(
-                ExecutionResult(
-                    stage="POLICY",
-                    status=status,
-                    message=f"Policy triggered: {policy.id}",
-                    logs=[policy.message],
-                )
-            )
+        if matched:
+            triggered.append({
+                "policy_id": policy_id,
+                "action": action,
+                "message": message,
+            })
+            if action == "BLOCK":
+                blocked = True
 
-    return results
+    if blocked:
+        status = Status.BLOCKED
+    elif triggered:
+        status = Status.WARNING
+    else:
+        status = Status.SUCCESS
+
+    return [
+        ExecutionResult(
+            stage="POLICY",
+            status=status,
+            message="Policy evaluation completed",
+            policy_report={
+                "total_policies": len(policies),
+                "triggered": triggered,
+                "blocked": blocked,
+            },
+        )
+    ]

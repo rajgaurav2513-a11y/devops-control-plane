@@ -4,11 +4,11 @@ import uuid
 import os
 
 from core.models.result import ExecutionResult, Status
+from core.policy.evaluator import evaluate_policies
+from core.intent.validator import validate_intent
+
 from state.execution_store import mark_stage_complete, get_last_completed_stage
 from state.snapshots import save_snapshot
-
-from core.intent.validator import validate_intent
-from core.policy.evaluator import evaluate_policies
 
 from engines.source.git_agent import prepare_source, cleanup_source
 from engines.container.builder import build_image
@@ -110,7 +110,6 @@ def execute(intent: dict):
                     stage="BUILD",
                     status=Status.BLOCKED,
                     message="Docker engine not reachable",
-                    logs=[],
                 )
             )
             return results
@@ -173,7 +172,7 @@ def execute(intent: dict):
         mark_stage_complete(execution_id, "POLICY")
 
     # -----------------------------
-    # RUN (CONTAINER TEST RUN)
+    # RUN
     # -----------------------------
     if code_required and should_run("RUN"):
         app = intent.get("application", {}).get("name", "app").lower()

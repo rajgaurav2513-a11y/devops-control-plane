@@ -1,4 +1,5 @@
 from core.models.result import ExecutionResult, Status
+from core.policy.config_policies import evaluate_config_prod_policies
 
 
 def _get_nested(data: dict, key: str):
@@ -15,11 +16,12 @@ def evaluate_policies(intent: dict):
     triggered = []
     blocked = False
 
+    # Generic intent policies
     for policy in policies:
         condition = policy.get("when", {})
-        action = policy.get("action")
+        action = policy.get("action", "WARN")
         message = policy.get("message", "")
-        policy_id = policy.get("id")
+        policy_id = policy.get("id", "unknown-policy")
 
         matched = True
         for key, expected in condition.items():
@@ -36,12 +38,13 @@ def evaluate_policies(intent: dict):
             if action == "BLOCK":
                 blocked = True
 
-    if blocked:
-        status = Status.BLOCKED
-    elif triggered:
-        status = Status.WARNING
-    else:
-        status = Status.SUCCESS
+    # CONFIG prod-safety policies
+    config_results = evaluate_config_prod_policies(intent)
+    for r in config_results:
+        if r.status == Status.BLOCKED:
+            return [r]
+
+    status = Status.BLOCKED if blocked else Status.WARNING if triggered else Status.SUCCESS
 
     return [
         ExecutionResult(

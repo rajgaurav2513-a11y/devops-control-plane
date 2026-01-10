@@ -24,6 +24,13 @@ from engines.infra.public_exposure_rules import evaluate_public_exposure
 from engines.infra.cost_risk_rules import evaluate_cost_risk
 from engines.infra.fix_suggestion_engine import generate_infra_fix_suggestions
 
+from engines.kubernetes.dry_run import kubernetes_dry_run
+from engines.kubernetes.apply import kubernetes_apply
+
+from engines.config.rolling import rolling_apply
+from engines.container.adapters.image_publish import publish_image
+
+
 from engines.deploy.local_docker import deploy_local
 from engines.deploy.local_auto import auto_deploy_local
 
@@ -31,10 +38,14 @@ from engines.deploy.local_auto import auto_deploy_local
 STAGE_ORDER = [
     "SOURCE",
     "BUILD",
+    "IMAGE-PUBLISH",
     "TEST",
     "QUALITY",
     "CONFIG",
     "POLICY",
+    "CONFIG-ROLLING",
+    "K8S-DRY-RUN",
+    "K8S-APPLY",
     "RUN",
     "INFRA",
     "INFRA-RISK",
@@ -42,6 +53,8 @@ STAGE_ORDER = [
     "INFRA-COST-RISK",
     "FIX-SUGGESTIONS",
     "SNAPSHOT",
+    "CONFIG-ROLLBACK",
+
 ]
 
 
@@ -74,9 +87,7 @@ def execute(intent: dict):
     code_required = is_code_required(intent)
     infra_required = has_infra(intent)
 
-    # -----------------------------
-    # SOURCE (LOCAL PATH OR GIT)
-    # -----------------------------
+    # SOURCE
     if code_required and should_run("SOURCE"):
         app_cfg = intent.get("application", {})
         local_path = app_cfg.get("path")
@@ -100,9 +111,7 @@ def execute(intent: dict):
         intent["_execution"]["workspace"] = workspace
         mark_stage_complete(execution_id, "SOURCE")
 
-    # -----------------------------
     # BUILD
-    # -----------------------------
     if code_required and should_run("BUILD"):
         if not docker_available():
             results.append(
@@ -122,9 +131,20 @@ def execute(intent: dict):
 
         mark_stage_complete(execution_id, "BUILD")
 
-    # -----------------------------
+        # -----------------------------
+        # IMAGE PUBLISH
+        # -----------------------------
+    if should_run("IMAGE-PUBLISH"):
+        r = publish_image(intent)
+        results.append(r)
+        if r.status == Status.BLOCKED:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "IMAGE-PUBLISH")
+
+
     # TEST
-    # -----------------------------
     if code_required and should_run("TEST"):
         r = run_tests(intent)
         results.append(r)
@@ -134,9 +154,7 @@ def execute(intent: dict):
 
         mark_stage_complete(execution_id, "TEST")
 
-    # -----------------------------
     # QUALITY
-    # -----------------------------
     if code_required and should_run("QUALITY"):
         r = run_quality_checks(intent)
         results.append(r)
@@ -146,9 +164,7 @@ def execute(intent: dict):
 
         mark_stage_complete(execution_id, "QUALITY")
 
-    # -----------------------------
-    # CONFIG
-    # -----------------------------
+    # CONFIG (intent validation)
     if should_run("CONFIG"):
         r = validate_intent(intent)
         results.append(r)
@@ -158,22 +174,49 @@ def execute(intent: dict):
 
         mark_stage_complete(execution_id, "CONFIG")
 
-    # -----------------------------
-    # POLICY (ENFORCED)
-    # -----------------------------
+    # POLICY
     if should_run("POLICY"):
         policy_results = evaluate_policies(intent)
-        results.extend(policy_results)
+    results.extend(policy_results)
 
-        if any(r.status == Status.BLOCKED for r in policy_results):
+    if any(r.status == Status.BLOCKED for r in policy_results):
+        cleanup_source(intent)
+        return results
+
+    mark_stage_complete(execution_id, "POLICY")
+
+
+    # CONFIG ROLLING (native config engine)
+    if "config" in intent and should_run("CONFIG-ROLLING"):
+        r = rolling_apply(intent)
+        results.append(r)
+        if r.status == Status.BLOCKED:
             cleanup_source(intent)
             return results
 
-        mark_stage_complete(execution_id, "POLICY")
+        mark_stage_complete(execution_id, "CONFIG-ROLLING")
 
-    # -----------------------------
+    # KUBERNETES DRY-RUN
+    if "kubernetes" in intent and should_run("K8S-DRY-RUN"):
+        r = kubernetes_dry_run(intent)
+        results.append(r)
+        if r.status == Status.BLOCKED:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "K8S-DRY-RUN")
+
+    # KUBERNETES APPLY (explicit)
+    if intent.get("_apply_k8s") and should_run("K8S-APPLY"):
+        r = kubernetes_apply(intent)
+        results.append(r)
+        if r.status == Status.BLOCKED:
+            cleanup_source(intent)
+            return results
+
+        mark_stage_complete(execution_id, "K8S-APPLY")
+
     # RUN
-    # -----------------------------
     if code_required and should_run("RUN"):
         app = intent.get("application", {}).get("name", "app").lower()
         image = f"{app}:{artifact_tag}"
@@ -186,9 +229,7 @@ def execute(intent: dict):
 
         mark_stage_complete(execution_id, "RUN")
 
-    # -----------------------------
     # INFRA (PLAN ONLY)
-    # -----------------------------
     if infra_required and should_run("INFRA"):
         plan = provision(intent)
         normalized = normalize_plan(plan)
@@ -209,9 +250,7 @@ def execute(intent: dict):
 
         mark_stage_complete(execution_id, "INFRA")
 
-    # -----------------------------
     # INFRA RISKS
-    # -----------------------------
     if infra_required and should_run("INFRA-RISK"):
         r = evaluate_risks(normalized)
         results.append(r)
@@ -235,17 +274,13 @@ def execute(intent: dict):
 
         mark_stage_complete(execution_id, "INFRA-COST-RISK")
 
-    # -----------------------------
     # FIX SUGGESTIONS
-    # -----------------------------
     if should_run("FIX-SUGGESTIONS"):
         r = generate_infra_fix_suggestions(results)
         results.append(r)
         mark_stage_complete(execution_id, "FIX-SUGGESTIONS")
 
-    # -----------------------------
     # SNAPSHOT
-    # -----------------------------
     if should_run("SNAPSHOT"):
         save_snapshot(intent)
         results.append(
@@ -261,9 +296,7 @@ def execute(intent: dict):
         )
         mark_stage_complete(execution_id, "SNAPSHOT")
 
-    # -----------------------------
-    # AUTO-DEPLOY (V2)
-    # -----------------------------
+    # AUTO-DEPLOY (existing behavior)
     exec_mode = intent.get("execution", {}).get("mode", "analyze")
     deploy_cfg = intent.get("deploy", {})
     blocked = any(r.status == Status.BLOCKED for r in results)

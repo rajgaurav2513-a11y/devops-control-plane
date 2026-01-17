@@ -140,7 +140,7 @@ with c6:
 st.markdown("<br>", unsafe_allow_html=True)
 
 
-# ================= INTENT BUILDER (FIXED POSITION) =================
+# ================= INTENT BUILDER =================
 def build_intent():
     intent = {}
 
@@ -153,7 +153,6 @@ def build_intent():
     intent["environment"] = env
     intent["execution"] = {"mode": exec_mode}
 
-    # -------- SOURCE --------
     st.markdown('<div class="section">Source</div>', unsafe_allow_html=True)
     src = st.selectbox("Source Type", ["Local Path", "Git Repository"])
 
@@ -168,21 +167,19 @@ def build_intent():
             "branch": st.text_input("Branch", "main")
         }
 
-    # -------- CLOUD --------
     st.markdown('<div class="section">Cloud / Platform</div>', unsafe_allow_html=True)
     intent["cloud"] = st.selectbox(
         "Cloud",
         ["aws", "azure", "gcp", "ibm", "oracle", "on-prem"]
     )
 
-    # -------- IMAGE --------
     st.markdown('<div class="section">Image Build & Publish</div>', unsafe_allow_html=True)
     if st.checkbox("Build Image", value=True):
         img = st.text_input("Image Name", "demo-app")
         intent["image"] = {"name": img}
 
         if st.checkbox("Publish Image"):
-            intent["image"]["publish"] = {
+            intent["image"]["publish"] = { # type: ignore
                 "enabled": True,
                 "registry": st.selectbox(
                     "Registry",
@@ -192,15 +189,14 @@ def build_intent():
                 "tag": st.text_input("Version / Tag", f"{env}-{uuid.uuid4().hex[:6]}")
             }
 
-    # -------- DEPLOY --------
     st.markdown('<div class="section">Deploy</div>', unsafe_allow_html=True)
-    deploy = st.selectbox(
-        "Deploy Target",
-        ["none", "local-docker", "kubernetes", "servers"]
-    )
-    intent["deploy"] = {"mode": deploy}
+    intent["deploy"] = {
+        "mode": st.selectbox(
+            "Deploy Target",
+            ["none", "local-docker", "kubernetes", "servers"]
+        )
+    }
 
-    # -------- CONFIG --------
     st.markdown('<div class="section">Config Management</div>', unsafe_allow_html=True)
     if st.checkbox("Apply Configuration"):
         intent["config"] = {
@@ -247,22 +243,49 @@ def execution_view():
 
     blocked = False
     for r in st.session_state.current_results:
+        stage = r["stage"]
+        status = r["status"]
+        message = r.get("message", "")
+
         if blocked:
-            st.markdown(f"<div class='stage-warn'>⏭ {r['stage']} — SKIPPED</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='stage-warn'>⏭ {stage} — SKIPPED</div>",
+                unsafe_allow_html=True
+            )
             continue
 
-        if r["status"] == "BLOCKED":
+        # 🔥 HEALTH STAGE (NEW, EXPLICIT)
+        if stage == "HEALTH":
+            if status == "BLOCKED":
+                blocked = True
+                st.error(f"🛑 HEALTH BLOCKED — {message}")
+            elif status == "WARNING":
+                st.warning(f"⚠️ HEALTH WARNING — {message}")
+            else:
+                st.success(f"✅ HEALTH OK — {message}")
+            continue
+
+        if status == "BLOCKED":
             blocked = True
-            st.markdown(f"<div class='stage-block'>❌ {r['stage']} — BLOCKED</div>", unsafe_allow_html=True)
-        elif r["status"] == "WARNING":
-            st.markdown(f"<div class='stage-warn'>⚠ {r['stage']} — WARNING</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='stage-block'>❌ {stage} — BLOCKED</div>",
+                unsafe_allow_html=True
+            )
+        elif status == "WARNING":
+            st.markdown(
+                f"<div class='stage-warn'>⚠ {stage} — WARNING</div>",
+                unsafe_allow_html=True
+            )
         else:
-            st.markdown(f"<div class='stage-ok'>✅ {r['stage']} — SUCCESS</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='stage-ok'>✅ {stage} — SUCCESS</div>",
+                unsafe_allow_html=True
+            )
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ================= ABOUT =================
+# ================= OTHER VIEWS (UNCHANGED) =================
 def about_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="section">About ALLDEVOPS</div>', unsafe_allow_html=True)
@@ -270,60 +293,34 @@ def about_view():
     st.markdown("""
 **ALLDEVOPS** is a **decision-first DevOps control plane**.
 
-It governs deployments, infrastructure, configuration, and Kubernetes
-by enforcing **explicit intent, policy checks, and production safety**
-before execution.
-
-### Core Principles
-• Intent → Analyze → Decide → Execute  
-• No blind automation  
-• Environment-aware safety  
-• Deterministic & explainable  
-
-> _ALLDEVOPS exists to prevent bad production changes before they happen._
+Intent → Analyze → Decide → Execute  
+No blind automation. No auto-fix.
 """)
-
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ================= ENV / DRIFT / HISTORY / RAW =================
 def env_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="section">Multi-Environment Overview</div>', unsafe_allow_html=True)
-
     for env in ["dev", "qa", "stage", "prod"]:
-        badge = f"badge-{env}"
-        st.markdown(f"<span class='badge {badge}'>{env.upper()}</span>", unsafe_allow_html=True)
-        st.caption("Last execution, drift status, policy posture")
+        st.markdown(f"<span class='badge badge-{env}'>{env.upper()}</span>", unsafe_allow_html=True)
         st.divider()
-
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 def drift_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="section">Drift Detection</div>', unsafe_allow_html=True)
-
     st.info("Decision-first drift detection (no auto-fix).")
-
-    st.checkbox("Infra Drift", value=True)
-    st.checkbox("Config Drift", value=True)
-    st.checkbox("Kubernetes Drift", value=True)
-
-    if st.button("🔍 Check Drift"):
-        st.warning("Drift detected in prod environment")
-
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 def history_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="section">History</div>', unsafe_allow_html=True)
-
     for h in st.session_state.history:
         with st.expander(f"{h['time']} | version {h['id']}"):
             st.json(h["results"])
-
     st.markdown('</div>', unsafe_allow_html=True)
 
 

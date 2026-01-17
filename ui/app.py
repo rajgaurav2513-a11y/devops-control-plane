@@ -116,7 +116,7 @@ def save_execution(intent, results):
 
 
 # ================= NAV =================
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 
 with c1:
     if st.button("🧭 Execution"):
@@ -131,13 +131,16 @@ with c4:
     if st.button("📜 History"):
         st.session_state.active_tab = "HISTORY"
 with c5:
+    if st.button("ℹ️ About"):
+        st.session_state.active_tab = "ABOUT"
+with c6:
     if st.button("📄 Raw"):
         st.session_state.active_tab = "RAW"
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 
-# ================= INTENT BUILDER =================
+# ================= INTENT BUILDER (FIXED POSITION) =================
 def build_intent():
     intent = {}
 
@@ -259,7 +262,31 @@ def execution_view():
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ================= ENV DASHBOARD =================
+# ================= ABOUT =================
+def about_view():
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="section">About ALLDEVOPS</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+**ALLDEVOPS** is a **decision-first DevOps control plane**.
+
+It governs deployments, infrastructure, configuration, and Kubernetes
+by enforcing **explicit intent, policy checks, and production safety**
+before execution.
+
+### Core Principles
+• Intent → Analyze → Decide → Execute  
+• No blind automation  
+• Environment-aware safety  
+• Deterministic & explainable  
+
+> _ALLDEVOPS exists to prevent bad production changes before they happen._
+""")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ================= ENV / DRIFT / HISTORY / RAW =================
 def env_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="section">Multi-Environment Overview</div>', unsafe_allow_html=True)
@@ -267,61 +294,39 @@ def env_view():
     for env in ["dev", "qa", "stage", "prod"]:
         badge = f"badge-{env}"
         st.markdown(f"<span class='badge {badge}'>{env.upper()}</span>", unsafe_allow_html=True)
-        st.caption("Last execution, drift status, policy posture (live via history)")
+        st.caption("Last execution, drift status, policy posture")
         st.divider()
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ================= DRIFT =================
 def drift_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="section">Drift Detection</div>', unsafe_allow_html=True)
 
     st.info("Decision-first drift detection (no auto-fix).")
 
-    st.checkbox("Infra Drift (Terraform plan vs state)", value=True)
-    st.checkbox("Config Drift (desired vs actual)", value=True)
-    st.checkbox("Kubernetes Drift (manifest vs live)", value=True)
+    st.checkbox("Infra Drift", value=True)
+    st.checkbox("Config Drift", value=True)
+    st.checkbox("Kubernetes Drift", value=True)
 
     if st.button("🔍 Check Drift"):
         st.warning("Drift detected in prod environment")
-        st.write("• Terraform resource modified manually")
-        st.write("• Service state drift on host 10.0.1.12")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ================= HISTORY =================
 def history_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="section">History</div>', unsafe_allow_html=True)
 
     for h in st.session_state.history:
         with st.expander(f"{h['time']} | version {h['id']}"):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                if st.button(f"🔁 Re-Analyze {h['id']}"):
-                    st.session_state.current_intent = h["intent"]
-                    st.session_state.current_results = None
-                    st.session_state.active_tab = "EXECUTION"
-
-            with col2:
-                if st.button(f"🚀 Re-Deploy {h['id']}"):
-                    intent = dict(h["intent"])
-                    intent["execution"] = {"mode": "auto-deploy"}
-                    res = execute(intent)
-                    st.session_state.current_results = [r.to_dict() for r in res]
-                    save_execution(intent, st.session_state.current_results)
-                    st.session_state.active_tab = "EXECUTION"
-
             st.json(h["results"])
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ================= RAW =================
 def raw_view():
     st.json(st.session_state.current_results)
 
@@ -335,5 +340,7 @@ elif st.session_state.active_tab == "DRIFT":
     drift_view()
 elif st.session_state.active_tab == "HISTORY":
     history_view()
+elif st.session_state.active_tab == "ABOUT":
+    about_view()
 elif st.session_state.active_tab == "RAW":
     raw_view()

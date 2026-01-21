@@ -46,15 +46,8 @@ st.markdown("""
   border-radius:16px;
   margin-bottom:20px;
 }
-.logo {
-  font-size:32px;
-  font-weight:900;
-  letter-spacing:1px;
-}
-.subtitle {
-  font-size:14px;
-  opacity:0.9;
-}
+.logo { font-size:32px; font-weight:900; }
+.subtitle { font-size:14px; opacity:0.9; }
 
 .card {
   background:white;
@@ -64,27 +57,11 @@ st.markdown("""
   margin-bottom:18px;
 }
 
-.section {
-  font-size:16px;
-  font-weight:800;
-  margin-bottom:10px;
-}
+.section { font-size:16px; font-weight:800; margin-bottom:10px; }
 
 .stage-ok { background:#E8F5EE; padding:10px; border-radius:8px; }
 .stage-warn { background:#FFF4CE; padding:10px; border-radius:8px; }
 .stage-block { background:#FDE7E9; padding:10px; border-radius:8px; }
-
-.badge {
-  display:inline-block;
-  padding:4px 10px;
-  border-radius:12px;
-  font-size:12px;
-  font-weight:700;
-}
-.badge-dev { background:#E8F5EE; }
-.badge-qa { background:#FFF4CE; }
-.badge-stage { background:#E6F2FF; }
-.badge-prod { background:#FDE7E9; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -106,9 +83,8 @@ def now():
 
 
 def save_execution(intent, results):
-    exec_id = intent.get("_execution", {}).get("id", str(uuid.uuid4())[:8])
     st.session_state.history.insert(0, {
-        "id": exec_id,
+        "id": str(uuid.uuid4())[:8],
         "time": now(),
         "intent": intent,
         "results": results,
@@ -116,28 +92,22 @@ def save_execution(intent, results):
 
 
 # ================= NAV =================
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-
+c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     if st.button("🧭 Execution"):
         st.session_state.active_tab = "EXECUTION"
 with c2:
-    if st.button("🌍 Environments"):
-        st.session_state.active_tab = "ENV"
-with c3:
     if st.button("📉 Drift"):
         st.session_state.active_tab = "DRIFT"
-with c4:
+with c3:
     if st.button("📜 History"):
         st.session_state.active_tab = "HISTORY"
-with c5:
+with c4:
     if st.button("ℹ️ About"):
         st.session_state.active_tab = "ABOUT"
-with c6:
+with c5:
     if st.button("📄 Raw"):
         st.session_state.active_tab = "RAW"
-
-st.markdown("<br>", unsafe_allow_html=True)
 
 
 # ================= INTENT BUILDER =================
@@ -153,50 +123,44 @@ def build_intent():
     intent["environment"] = env
     intent["execution"] = {"mode": exec_mode}
 
+    # ---------- SOURCE ----------
     st.markdown('<div class="section">Source</div>', unsafe_allow_html=True)
     src = st.selectbox("Source Type", ["Local Path", "Git Repository"])
 
     if src == "Local Path":
         intent["application"] = {
-            "name": st.text_input("Application Name", "demo-app"),
+            "name": "demo-app",
             "path": st.text_input("Application Path", "./sample-python-app")
         }
     else:
-        intent["source"] = {
+        intent["application"] = {
+            "name": "demo-app",
             "repo": st.text_input("Repo URL"),
             "branch": st.text_input("Branch", "main")
         }
 
-    st.markdown('<div class="section">Cloud / Platform</div>', unsafe_allow_html=True)
-    intent["cloud"] = st.selectbox(
-        "Cloud",
-        ["aws", "azure", "gcp", "ibm", "oracle", "on-prem"]
-    )
+    # ---------- IMAGE ----------
+    st.markdown('<div class="section">Image Build</div>', unsafe_allow_html=True)
+    if st.checkbox("Build Image"):
+        intent["image"] = {
+            "name": st.text_input("Image Name", "demo-app")
+        }
 
-    st.markdown('<div class="section">Image Build & Publish</div>', unsafe_allow_html=True)
-    if st.checkbox("Build Image", value=True):
-        img = st.text_input("Image Name", "demo-app")
-        intent["image"] = {"name": img}
-
-        if st.checkbox("Publish Image"):
-            intent["image"]["publish"] = { # type: ignore
-                "enabled": True,
-                "registry": st.selectbox(
-                    "Registry",
-                    ["dockerhub", "aws-ecr", "azure-acr", "gcp-gar"]
-                ),
-                "repository": st.text_input("Target Repository"),
-                "tag": st.text_input("Version / Tag", f"{env}-{uuid.uuid4().hex[:6]}")
+    # ---------- INFRA ----------
+    st.markdown('<div class="section">Infrastructure</div>', unsafe_allow_html=True)
+    if st.checkbox("Enable Infrastructure"):
+        intent["infrastructure"] = {
+            "tool": "terraform",
+            "mode": "plan",
+            "auto_apply": False,
+            "risk": {
+                "public": st.checkbox("Detect Public Exposure", True),
+                "cost": st.checkbox("Detect Cost Risk", True),
+                "blast": st.checkbox("Detect Blast Radius", True),
             }
+        }
 
-    st.markdown('<div class="section">Deploy</div>', unsafe_allow_html=True)
-    intent["deploy"] = {
-        "mode": st.selectbox(
-            "Deploy Target",
-            ["none", "local-docker", "kubernetes", "servers"]
-        )
-    }
-
+    # ---------- CONFIG ----------
     st.markdown('<div class="section">Config Management</div>', unsafe_allow_html=True)
     if st.checkbox("Apply Configuration"):
         intent["config"] = {
@@ -211,29 +175,71 @@ def build_intent():
                 "key_path": st.text_input("SSH Key Path", "~/.ssh/id_rsa")
             },
             "rollout": {
-                "batch_size": st.number_input("Batch Size", 1, 50, 2),
-                "pause_on_failure": True
+                "batch_size": st.number_input("Batch Size", 1, 20, 2),
+                "pause_on_failure": True,
+                "rollback_on_failure": True
             }
         }
+
+    # ---------- TESTING ----------
+    st.markdown('<div class="section">Testing</div>', unsafe_allow_html=True)
+
+    if st.checkbox("Enable Testing"):
+        test_type = st.selectbox(
+            "Test Type",
+            ["smoke", "api", "selenium", "performance"]
+        )
+
+        intent["testing"] = {
+            "enabled": True,
+            "type": test_type,
+            "target": st.text_input("Target URL", "http://localhost:8080")
+        }
+
+        if test_type == "smoke":
+            intent["testing"]["checks"] = [
+                {"type": "http", "path": "/health", "expect": 200}
+            ]
+
+        if test_type == "api":
+            intent["testing"]["api"] = [
+                {"path": "/health", "method": "GET", "expect_status": 200}
+            ]
+
+        if test_type == "selenium":
+            intent["testing"]["ui"] = [
+                {"open": "/"},
+                {"expect_text": "Welcome"}
+            ]
+
+        if test_type == "performance":
+            intent["testing"]["performance"] = {
+                "users": st.number_input("Virtual Users", 10, 1000, 50),
+                "duration": st.text_input("Duration", "1m")
+            }
+
+    # ---------- DEPLOY ----------
+    st.markdown('<div class="section">Deploy</div>', unsafe_allow_html=True)
+    intent["deploy"] = {
+        "mode": st.selectbox("Deploy Mode", ["none", "local-docker"])
+    }
 
     st.markdown('</div>', unsafe_allow_html=True)
     return intent
 
 
-# ================= EXECUTION =================
+# ================= EXECUTION VIEW =================
 def execution_view():
     intent = build_intent()
 
-    with st.expander("🔍 View Generated Intent (Advanced)"):
+    with st.expander("🔍 View Generated Intent"):
         st.code(yaml.dump(intent, sort_keys=False), language="yaml")
 
     if st.button("▶ Run Execution", use_container_width=True):
-        with st.spinner("Executing decision pipeline..."):
-            res = execute(intent)
-            res = [r.to_dict() for r in res]
-            st.session_state.current_results = res
-            st.session_state.current_intent = intent
-            save_execution(intent, res)
+        res = execute(intent)
+        res = [r.to_dict() for r in res]
+        st.session_state.current_results = res
+        save_execution(intent, res)
 
     if not st.session_state.current_results:
         return
@@ -245,96 +251,41 @@ def execution_view():
     for r in st.session_state.current_results:
         stage = r["stage"]
         status = r["status"]
-        message = r.get("message", "")
+        msg = r.get("message", "")
 
-        if blocked:
-            st.markdown(
-                f"<div class='stage-warn'>⏭ {stage} — SKIPPED</div>",
-                unsafe_allow_html=True
-            )
-            continue
-
-        # 🔥 HEALTH STAGE (NEW, EXPLICIT)
-        if stage == "HEALTH":
-            if status == "BLOCKED":
-                blocked = True
-                st.error(f"🛑 HEALTH BLOCKED — {message}")
-            elif status == "WARNING":
-                st.warning(f"⚠️ HEALTH WARNING — {message}")
-            else:
-                st.success(f"✅ HEALTH OK — {message}")
-            continue
-
-        if status == "BLOCKED":
+        if blocked or status == "SKIPPED":
+            st.markdown(f"<div class='stage-warn'>⏭ {stage} — SKIPPED</div>", unsafe_allow_html=True)
+        elif status == "BLOCKED":
             blocked = True
-            st.markdown(
-                f"<div class='stage-block'>❌ {stage} — BLOCKED</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"<div class='stage-block'>❌ {stage} — {msg}</div>", unsafe_allow_html=True)
         elif status == "WARNING":
-            st.markdown(
-                f"<div class='stage-warn'>⚠ {stage} — WARNING</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"<div class='stage-warn'>⚠ {stage} — {msg}</div>", unsafe_allow_html=True)
         else:
-            st.markdown(
-                f"<div class='stage-ok'>✅ {stage} — SUCCESS</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"<div class='stage-ok'>✅ {stage}</div>", unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ================= OTHER VIEWS (UNCHANGED) =================
-def about_view():
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section">About ALLDEVOPS</div>', unsafe_allow_html=True)
-
-    st.markdown("""
-**ALLDEVOPS** is a **decision-first DevOps control plane**.
-
-Intent → Analyze → Decide → Execute  
-No blind automation. No auto-fix.
-""")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def env_view():
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section">Multi-Environment Overview</div>', unsafe_allow_html=True)
-    for env in ["dev", "qa", "stage", "prod"]:
-        st.markdown(f"<span class='badge badge-{env}'>{env.upper()}</span>", unsafe_allow_html=True)
-        st.divider()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def drift_view():
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section">Drift Detection</div>', unsafe_allow_html=True)
-    st.info("Decision-first drift detection (no auto-fix).")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
+# ================= OTHER VIEWS =================
 def history_view():
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section">History</div>', unsafe_allow_html=True)
     for h in st.session_state.history:
-        with st.expander(f"{h['time']} | version {h['id']}"):
+        with st.expander(f"{h['time']} | {h['id']}"):
             st.json(h["results"])
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+def about_view():
+    st.markdown('<div class="card">ALLDEVOPS – Decision-first DevOps control plane</div>', unsafe_allow_html=True)
 
 
 def raw_view():
     st.json(st.session_state.current_results)
 
 
-# ================= RENDER =================
+# ================= ROUTER =================
 if st.session_state.active_tab == "EXECUTION":
     execution_view()
-elif st.session_state.active_tab == "ENV":
-    env_view()
-elif st.session_state.active_tab == "DRIFT":
-    drift_view()
 elif st.session_state.active_tab == "HISTORY":
     history_view()
 elif st.session_state.active_tab == "ABOUT":

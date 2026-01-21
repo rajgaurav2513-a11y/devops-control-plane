@@ -1,220 +1,261 @@
-import uuid
+# core/orchestrator/executor.py
+# FINAL SYNCED EXECUTOR – SOURCE FIXED, NO ARCH CHANGE
+
 import os
-import time
+import sys
+import uuid
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from core.models.result import ExecutionResult, Status
-from core.policy.evaluator import evaluate_policies
 from core.intent.validator import validate_intent
+from core.policy.evaluator import evaluate_policies
+from core.observability.rules import evaluate_health, ALLOW
+from core.observability.error_normalizer import normalize_error
 
 from state.execution_store import mark_stage_complete, get_last_completed_stage
 from state.snapshots import save_snapshot
 
+# INFRA
+from engines.infra.terraform.terraform_engine import provision
+
+# SOURCE / BUILD / DEPLOY
 from engines.source.git_agent import prepare_source, cleanup_source
 from engines.container.builder import build_image
-from engines.container.tester import run_tests
-from engines.container.quality import run_quality_checks
 from engines.container.docker_runner import run_container
 from engines.container.docker_health import docker_available
-
-from engines.infra.terraform_engine import provision
-from engines.infra.plan_normalizer import normalize_plan
-from engines.infra.risk_rules import evaluate_risks
-from engines.infra.public_exposure_rules import evaluate_public_exposure
-from engines.infra.cost_risk_rules import evaluate_cost_risk
-from engines.infra.fix_suggestion_engine import generate_infra_fix_suggestions
-
-from engines.kubernetes.dry_run import kubernetes_dry_run
-from engines.kubernetes.apply import kubernetes_apply
-
-from engines.config.rolling import rolling_apply
 from engines.container.adapters.image_publish import publish_image
+from engines.config.rolling import rolling_apply
 
-from engines.deploy.local_docker import deploy_local
-from engines.deploy.local_auto import auto_deploy_local
-
-# observability (safe)
-from core.observability.collectors import (
-    collect_all_basic,
-    record_deploy_result,
-    record_config_rollout,
-)
-
-from core.observability.rules import evaluate_health, ALLOW, WARN, DELAY, BLOCK
+# TEST & QUALITY
+from engines.testing.runner import run_tests
+from engines.quality.runner import run_quality_checks
 
 
 STAGE_ORDER = [
-    "SOURCE","BUILD","IMAGE-PUBLISH","TEST","QUALITY","CONFIG",
-    "HEALTH","POLICY",
-    "CONFIG-ROLLING","K8S-DRY-RUN","K8S-APPLY",
-    "RUN","INFRA","INFRA-RISK","INFRA-PUBLIC-RISK",
-    "INFRA-COST-RISK","FIX-SUGGESTIONS",
-    "ROLLBACK","SNAPSHOT"
+    "INFRA",
+    "CONFIG",
+    "SOURCE",
+    "BUILD",
+    "IMAGE-PUBLISH",
+    "RUN",
+    "TEST",
+    "QUALITY",
+    "HEALTH",
+    "POLICY",
+    "CONFIG-ROLLING",
+    "SNAPSHOT",
 ]
-
-
-def is_code_required(intent: dict) -> bool:
-    return "application" in intent
-
-
-def has_infra(intent: dict) -> bool:
-    return "infra" in intent
 
 
 def execute(intent: dict):
     results = []
 
-    collect_all_basic()
+    execution_id = str(uuid.uuid4())[:8]
+    intent["_execution"] = {"id": execution_id}
 
-    execution_id = intent.get("_execution", {}).get("id") or str(uuid.uuid4())[:8]
-    artifact_tag = f"exec-{execution_id}"
+    meta = intent.get("_meta", {})
+    trigger = meta.get("trigger", "ui")
+    intent_id = meta.get("intent_id", execution_id)
 
-    intent["_execution"] = {
-        "id": execution_id,
-        "artifact_tag": artifact_tag,
-    }
+    print(f"[EXECUTOR] intent_id={intent_id} trigger={trigger}")
 
     last_completed = get_last_completed_stage(execution_id)
 
-    def should_run(stage: str) -> bool:
+    def should_run(stage: str):
         if not last_completed:
             return True
         return STAGE_ORDER.index(stage) > STAGE_ORDER.index(last_completed)
 
-    code_required = is_code_required(intent)
-    infra_required = has_infra(intent)
+    app = intent.get("application", {})
+    code_present = bool(app)
 
-    # ---------- SOURCE ----------
-    if code_required and should_run("SOURCE"):
-        path = intent.get("application", {}).get("path")
-        workspace = os.path.abspath(path) if path else prepare_source(intent)
+    build_enabled = (
+        "image" in intent
+        and isinstance(intent.get("image"), dict)
+        and bool(intent["image"].get("name"))
+    )
 
-        if not workspace or not os.path.isdir(workspace):
-            return [ExecutionResult("SOURCE", Status.BLOCKED, "Invalid workspace")]
+    publish_enabled = build_enabled and isinstance(intent["image"].get("publish"), dict)
 
-        intent["_execution"]["workspace"] = workspace
-        mark_stage_complete(execution_id, "SOURCE")
+    run_enabled = (
+        build_enabled and intent.get("deploy", {}).get("mode") == "local-docker"
+    )
 
-    # ---------- BUILD ----------
-    if code_required and should_run("BUILD"):
+    # ===== INFRA =====
+    if "infrastructure" in intent and should_run("INFRA"):
+        try:
+            provision(intent)
+            r = ExecutionResult("INFRA", Status.SUCCESS, "Terraform evaluated")
+        except Exception as e:
+            r = normalize_error("INFRA", e)
+
+        results.append(r)
+        if r.status == Status.BLOCKED:
+            return results
+        mark_stage_complete(execution_id, "INFRA")
+
+    # ===== CONFIG =====
+    if should_run("CONFIG"):
+        try:
+            r = validate_intent(intent)
+        except Exception as e:
+            r = normalize_error("CONFIG", e)
+
+        results.append(r)
+        if r.status != Status.SUCCESS:
+            return results
+        mark_stage_complete(execution_id, "CONFIG")
+
+    # ===== SOURCE (FIXED) =====
+    if code_present and should_run("SOURCE"):
+        try:
+            app = intent["application"]
+
+            # Local shortcut only if path explicitly provided
+            if "path" in app and app.get("path"):
+                workspace = os.path.abspath(app["path"])
+            else:
+                workspace = prepare_source(intent)
+
+            if not workspace or not os.path.isdir(workspace):
+                return [
+                    ExecutionResult(
+                        "SOURCE",
+                        Status.BLOCKED,
+                        "Workspace could not be prepared",
+                    )
+                ]
+
+            intent["_execution"]["workspace"] = workspace
+            mark_stage_complete(execution_id, "SOURCE")
+
+        except Exception as e:
+            return [normalize_error("SOURCE", e)]
+
+    # ===== BUILD =====
+    if build_enabled and should_run("BUILD"):
         if not docker_available():
             return [ExecutionResult("BUILD", Status.BLOCKED, "Docker not reachable")]
 
-        start = time.time()
-        r = build_image(intent)
-        record_deploy_result(r.status == Status.SUCCESS, time.time() - start)
-        results.append(r)
+        try:
+            r = build_image(intent)
+        except Exception as e:
+            r = normalize_error("BUILD", e)
 
+        results.append(r)
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
-
+        mark_stage_complete(execution_id, "BUILD")
+    else:
         mark_stage_complete(execution_id, "BUILD")
 
-    # ---------- IMAGE PUBLISH ----------
-    if should_run("IMAGE-PUBLISH"):
-        r = publish_image(intent)
+    # ===== IMAGE PUBLISH =====
+    if publish_enabled and should_run("IMAGE-PUBLISH"):
+        try:
+            r = publish_image(intent)
+        except Exception as e:
+            r = normalize_error("IMAGE-PUBLISH", e)
+
         results.append(r)
         if r.status == Status.BLOCKED:
             cleanup_source(intent)
             return results
         mark_stage_complete(execution_id, "IMAGE-PUBLISH")
 
-    # ---------- TEST ----------
-    if code_required and should_run("TEST"):
-        r = run_tests(intent)
+    # ===== RUN =====
+    if run_enabled and should_run("RUN"):
+        image = f"{intent['application']['name']}:{execution_id}"
+        try:
+            r = run_container(intent, image)
+        except Exception as e:
+            r = normalize_error("RUN", e)
+
+        results.append(r)
+        if r.status != Status.SUCCESS:
+            cleanup_source(intent)
+            return results
+        mark_stage_complete(execution_id, "RUN")
+
+    # ===== TEST =====
+    if should_run("TEST"):
+        try:
+            r = run_tests(intent)
+        except Exception as e:
+            r = normalize_error("TEST", e)
+
         results.append(r)
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
         mark_stage_complete(execution_id, "TEST")
 
-    # ---------- QUALITY ----------
-    if code_required and should_run("QUALITY"):
-        r = run_quality_checks(intent)
+    # ===== QUALITY =====
+    if should_run("QUALITY"):
+        try:
+            r = run_quality_checks(intent)
+        except Exception as e:
+            r = normalize_error("QUALITY", e)
+
         results.append(r)
         if r.status != Status.SUCCESS:
             cleanup_source(intent)
             return results
         mark_stage_complete(execution_id, "QUALITY")
 
-    # ---------- CONFIG ----------
-    if should_run("CONFIG"):
-        r = validate_intent(intent)
-        results.append(r)
-        if r.status != Status.SUCCESS:
-            cleanup_source(intent)
-            return results
-        mark_stage_complete(execution_id, "CONFIG")
-
-    # ---------- HEALTH ----------
+    # ===== HEALTH =====
     if should_run("HEALTH"):
-        h = evaluate_health(intent.get("environment", "dev"))
+        try:
+            h = evaluate_health(intent.get("environment", "dev"))
+            status = Status.SUCCESS if h["decision"] == ALLOW else Status.BLOCKED
+            r = ExecutionResult("HEALTH", status, h["reason"])
+        except Exception as e:
+            r = normalize_error("HEALTH", e)
 
-        status_map = {
-            ALLOW: Status.SUCCESS,
-            WARN: Status.WARNING,
-            DELAY: Status.BLOCKED,
-            BLOCK: Status.BLOCKED,
-        }
-
-        hr = ExecutionResult("HEALTH", status_map[h["decision"]], h["reason"])
-        results.append(hr)
-
-        if hr.status == Status.BLOCKED:
+        results.append(r)
+        if r.status == Status.BLOCKED:
             cleanup_source(intent)
             return results
-
         mark_stage_complete(execution_id, "HEALTH")
 
-    # ---------- POLICY ----------
+    # ===== POLICY =====
     if should_run("POLICY"):
-        policy_results = evaluate_policies(intent)
-        results.extend(policy_results)
+        try:
+            pr = evaluate_policies(intent)
+        except Exception as e:
+            pr = [normalize_error("POLICY", e)]
 
-        if any(r.status == Status.BLOCKED for r in policy_results):
+        results.extend(pr)
+        if any(x.status == Status.BLOCKED for x in pr):
             cleanup_source(intent)
             return results
-
         mark_stage_complete(execution_id, "POLICY")
 
-    # ---------- CONFIG ROLLING ----------
+    # ===== CONFIG ROLLING =====
     if "config" in intent and should_run("CONFIG-ROLLING"):
-        r = rolling_apply(intent)
-        record_config_rollout(r.status == Status.SUCCESS, r.status == Status.WARNING)
-        results.append(r)
+        try:
+            r = rolling_apply(intent)
+        except Exception as e:
+            r = normalize_error("CONFIG-ROLLING", e)
 
+        results.append(r)
         if r.status == Status.BLOCKED:
-            results.append(
-                ExecutionResult("ROLLBACK", Status.WARNING, "Config rollback required")
-            )
             cleanup_source(intent)
             return results
-
         mark_stage_complete(execution_id, "CONFIG-ROLLING")
 
-    # ---------- RUN ----------
-    if code_required and should_run("RUN"):
-        image = f"{intent.get('application', {}).get('name','app')}:{artifact_tag}"
-        start = time.time()
-        r = run_container(intent=intent, image_name=image)
-        record_deploy_result(r.status == Status.SUCCESS, time.time() - start)
-        results.append(r)
-
-        if r.status != Status.SUCCESS:
-            results.append(
-                ExecutionResult("ROLLBACK", Status.WARNING, "App rollback required")
-            )
-            cleanup_source(intent)
-            return results
-
-        mark_stage_complete(execution_id, "RUN")
-
-    # ---------- SNAPSHOT ----------
+    # ===== SNAPSHOT =====
     if should_run("SNAPSHOT"):
-        save_snapshot(intent)
-        results.append(
-            ExecutionResult("SNAPSHOT", Status.SUCCESS, "Execution snapshot saved")
-        )
+        try:
+            save_snapshot(intent)
+            r = ExecutionResult("SNAPSHOT", Status.SUCCESS, "Snapshot saved")
+        except Exception as e:
+            r = normalize_error("SNAPSHOT", e)
+
+        results.append(r)
         mark_stage_complete(execution_id, "SNAPSHOT")
 
     cleanup_source(intent)

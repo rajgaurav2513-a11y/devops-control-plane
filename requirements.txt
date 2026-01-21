@@ -1,3 +1,4 @@
 pyyaml
 streamlit
 paramiko>=3.4.0
+selenium
